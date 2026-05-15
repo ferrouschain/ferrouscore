@@ -1,0 +1,59 @@
+[package]
+name = "ferrous-node"
+version = "0.1.0"
+edition = "2021"
+authors = ["Chronocoder"]
+description = "A next-generation, memory-safe Layer 1 blockchain engineered in Rust with modular architecture and P2P recovery."
+license = "MIT"
+repository = "https://github.com/ChronoCoders/ferrous"
+keywords = ["blockchain", "rust", "cryptocurrency", "layer1", "p2p"]
+
+[dependencies]
+sha2 = "0.10"
+secp256k1 = { version = "0.29", features = ["global-context", "rand"] }
+rand = "0.8"
+num-bigint = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tiny_http = "0.12"
+hex = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+ratatui = "0.26"
+crossterm = "0.27"
+sysinfo = "0.30"
+rayon = "1.10"
+num_cpus = "1.16"
+rocksdb = "0.22"
+bincode = "1.3"
+bs58 = "0.5"
+ripemd = "0.1"
+log = "0.4"
+env_logger = "0.10"
+tempfile = "3.10"
+chrono = "0.4"
+lru = "0.12"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+chacha20poly1305 = "0.10"
+ml-dsa = { version = "0.1.0-rc.11", features = ["getrandom"] }
+blake3 = "1.5"
+bech32 = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+randomx-rs = "1.4"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[profile.dev]
+overflow-checks = true
+
+[profile.release]
+overflow-checks = true
+
+[profile.dev.package.librocksdb-sys]
+opt-level = 3
+
+[[example]]
+name = "monitor"
+path = "examples/monitor.rs"

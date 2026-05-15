@@ -1,0 +1,1306 @@
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Frame, Terminal,
+};
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    io::{self, Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpStream},
+    process::{Child, Command},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+#[derive(Clone)]
+struct NodeStats {
+    name: String,
+    ip: String,
+    rpc_port: u16,
+    blocks: u32,
+    headers: u32,
+    best_hash: String,
+    chain: String,
+    difficulty: f64,
+    hash_rate: f64,
+    peer_count: Option<u32>,
+    connections: Option<u32>,
+    connections_in: Option<u32>,
+    connections_out: Option<u32>,
+    send_rate_mbps: Option<f64>,
+    recv_rate_mbps: Option<f64>,
+    uptime_secs: Option<u64>,
+    partition_detected: Option<bool>,
+    recovery_attempts: Option<u32>,
+    last_block_age_secs: Option<u64>,
+    rpc_rtt_ms: Option<u64>,
+    recent_blocks: Vec<RecentBlock>,
+    recent_txs: Vec<RecentTx>,
+    reachable: bool,
+    last_updated: Instant,
+    mining_error: Option<String>,
+    blocks_error: Option<String>,
+    network_error: Option<String>,
+    recovery_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct RecentBlock {
+    height: u32,
+    hash: String,
+    block_time: u64,
+    time_ago_secs: u64,
+    n_tx: u32,
+    size_bytes: u64,
+    miner: String,
+}
+
+#[derive(Clone)]
+struct RecentTx {
+    txid: String,
+    from: String,
+    amount_frr: f64,
+}
+
+struct NodeUpdate {
+    name: String,
+    stats: NodeStats,
+}
+
+/// Minimal RFC 4648 Base64 encoder — no external crate required.
+fn base64_encode(input: &str) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(CHARS[((n >> 18) & 0x3f) as usize] as char);
+        out.push(CHARS[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARS[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Read .rpc.cookie from the remote node via SSH and return a ready-to-use
+/// Base64-encoded credential for the Authorization header, or None on failure.
+fn read_cookie_via_ssh(remote_ip: &str) -> Option<String> {
+    let output = Command::new("ssh")
+        .args([
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "BatchMode=yes",
+            &format!("root@{}", remote_ip),
+            "cat /root/ferrous/data/.rpc.cookie",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let credential = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if credential.is_empty() {
+        None
+    } else {
+        Some(base64_encode(&credential))
+    }
+}
+
+fn spawn_ssh_tunnel(remote_ip: &str, local_port: u16) -> Option<Child> {
+    // Skip spawn if the port is already forwarding — avoids "Address already in use" noise.
+    if is_port_reachable(local_port) {
+        return None;
+    }
+    Command::new("ssh")
+        .args([
+            "-N",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-L",
+            &format!("{}:127.0.0.1:8332", local_port),
+            &format!("root@{}", remote_ip),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
+fn main() -> io::Result<()> {
+    // Auto-spawn SSH tunnels so no manual setup is needed.
+    let tunnel_1: Arc<Mutex<Option<Child>>> =
+        Arc::new(Mutex::new(spawn_ssh_tunnel("45.77.153.141", 18331)));
+    let tunnel_4: Arc<Mutex<Option<Child>>> =
+        Arc::new(Mutex::new(spawn_ssh_tunnel("45.77.64.221", 18332)));
+    // Give tunnels a moment to establish before polling begins.
+    thread::sleep(Duration::from_secs(2));
+
+    // Read RPC cookies from each node via SSH before tunnels start polling.
+    // Cookies are stable across restarts (commit 7d76866) so reading once is sufficient.
+    let auth_1 = read_cookie_via_ssh("45.77.153.141");
+    let auth_4 = read_cookie_via_ssh("45.77.64.221");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<NodeUpdate>();
+
+    // Tunnel watcher: respawn dead SSH tunnels every 10 seconds.
+    let watcher_stop = stop.clone();
+    let watcher_t1 = tunnel_1.clone();
+    let watcher_t4 = tunnel_4.clone();
+    thread::spawn(move || {
+        while !watcher_stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(10));
+            for (tunnel, ip, port) in [
+                (&watcher_t1, "45.77.153.141", 18331u16),
+                (&watcher_t4, "45.77.64.221", 18332u16),
+            ] {
+                let mut guard = tunnel.lock().unwrap();
+                let dead = match *guard {
+                    None => true,
+                    Some(ref mut child) => child.try_wait().ok().flatten().is_some(),
+                };
+                // spawn_ssh_tunnel already checks is_port_reachable, but skip the
+                // call entirely when the child is alive to avoid redundant work.
+                if dead {
+                    *guard = spawn_ssh_tunnel(ip, port);
+                }
+            }
+        }
+    });
+
+    let poller_1 = spawn_poller(
+        tx.clone(),
+        stop.clone(),
+        "seed1".to_string(),
+        "45.77.153.141".to_string(),
+        18331,
+        auth_1,
+    );
+    let poller_4 = spawn_poller(
+        tx,
+        stop.clone(),
+        "seed4".to_string(),
+        "45.77.64.221".to_string(),
+        18332,
+        auth_4,
+    );
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut seed1 = default_node_stats("seed1", "45.77.153.141", 18331);
+    let mut seed4 = default_node_stats("seed4", "45.77.64.221", 18332);
+    seed1.reachable = is_port_reachable(18331);
+    seed4.reachable = is_port_reachable(18332);
+    let mut last_updated_at = SystemTime::now();
+
+    let res = run_app(
+        &mut terminal,
+        &rx,
+        &mut seed1,
+        &mut seed4,
+        &mut last_updated_at,
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = poller_1.join();
+    let _ = poller_4.join();
+
+    if let Some(ref mut t) = *tunnel_1.lock().unwrap() {
+        let _ = t.kill();
+    }
+    if let Some(ref mut t) = *tunnel_4.lock().unwrap() {
+        let _ = t.kill();
+    }
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    res
+}
+
+fn run_app<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    rx: &mpsc::Receiver<NodeUpdate>,
+    seed1: &mut NodeStats,
+    seed4: &mut NodeStats,
+    last_updated_at: &mut SystemTime,
+) -> io::Result<()> {
+    loop {
+        while let Ok(update) = rx.try_recv() {
+            if update.name == seed1.name {
+                *seed1 = update.stats;
+            } else if update.name == seed4.name {
+                *seed4 = update.stats;
+            }
+            *last_updated_at = SystemTime::now();
+        }
+
+        terminal.draw(|f| render(f, seed1, seed4, *last_updated_at))?;
+
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(key) = event::read()? {
+                if key.code == KeyCode::Char('q') {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn render(f: &mut Frame, seed1: &NodeStats, seed4: &NodeStats, last_updated_at: SystemTime) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(10),
+            Constraint::Min(6),
+            Constraint::Min(6),
+            Constraint::Length(7),
+            Constraint::Length(1),
+        ])
+        .split(f.size());
+
+    render_nodes_row(f, chunks[0], seed1, seed4);
+    render_blocks_table(f, chunks[1], seed1, seed4);
+    render_txs_table(f, chunks[2], seed1, seed4);
+    render_summary_row(f, chunks[3], seed1, seed4);
+    render_footer(f, chunks[4], last_updated_at);
+}
+
+fn render_nodes_row(f: &mut Frame, area: Rect, seed1: &NodeStats, seed4: &NodeStats) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    render_node_panel(f, cols[0], seed1);
+    render_node_panel(f, cols[1], seed4);
+}
+
+fn render_node_panel(f: &mut Frame, area: Rect, node: &NodeStats) {
+    let title = format!("{} ({})", node.name, node.ip);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6)])
+        .split(inner);
+
+    let status = if node.reachable { "ONLINE" } else { "OFFLINE" };
+    let status_style = if node.reachable {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+
+    let sync_line = if node.blocks < node.headers {
+        Line::from(vec![
+            Span::styled("SYNCING", Style::default().fg(Color::Yellow)),
+            Span::raw(format!(" ({}/{})", node.blocks, node.headers)),
+        ])
+    } else {
+        Line::from(Span::styled("SYNCED", Style::default().fg(Color::Green)))
+    };
+
+    let peers_line = match node.peer_count {
+        Some(n) => format!("{}", n),
+        None => "N/A".to_string(),
+    };
+
+    let best_hash_short = if node.best_hash.len() > 24 {
+        &node.best_hash[..24]
+    } else {
+        &node.best_hash
+    };
+
+    let diff_line = if node.difficulty.is_finite() {
+        format!("{:.8}", node.difficulty)
+    } else {
+        "N/A".to_string()
+    };
+
+    let hash_rate_line = if node.hash_rate.is_finite() {
+        format!("{:.2} KH/s", node.hash_rate / 1000.0)
+    } else {
+        "N/A".to_string()
+    };
+
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::raw("Status: "),
+        Span::styled(status, status_style),
+    ])];
+
+    if !node.reachable {
+        lines.push(Line::from(""));
+        lines.push(Line::from("Tunnel not active. Run:"));
+        lines.push(Line::from(format!(
+            "ssh -N -L {}:127.0.0.1:8332 root@{}",
+            node.rpc_port, node.ip
+        )));
+    } else {
+        if let Some(err) = &node.mining_error {
+            lines.push(Line::from(Span::styled(
+                err.as_str(),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        if let Some(err) = &node.blocks_error {
+            lines.push(Line::from(Span::styled(
+                err.as_str(),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        if let Some(err) = &node.network_error {
+            lines.push(Line::from(Span::styled(
+                err.as_str(),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        if let Some(err) = &node.recovery_error {
+            lines.push(Line::from(Span::styled(
+                err.as_str(),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        lines.push(Line::from(format!(
+            "Chain: {}  Blocks: {}",
+            node.chain, node.blocks
+        )));
+        lines.push(sync_line);
+        lines.push(Line::from(format!("Peers: {}", peers_line)));
+        lines.push(Line::from(format!("Best: {}...", best_hash_short)));
+        lines.push(Line::from(format!("Difficulty: {}", diff_line)));
+        lines.push(Line::from(format!("Hash rate: {}", hash_rate_line)));
+    }
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(paragraph, chunks[0]);
+}
+
+fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+fn shorten_hash(hash: &str, len: usize) -> String {
+    if hash.len() > len * 2 {
+        format!("{}...{}", &hash[..len], &hash[hash.len() - len..])
+    } else {
+        hash.to_string()
+    }
+}
+
+fn shorten_addr(addr: &str, keep: usize) -> String {
+    if addr.len() > keep * 2 + 3 {
+        format!("{}...{}", &addr[..keep], &addr[addr.len() - keep..])
+    } else {
+        addr.to_string()
+    }
+}
+
+fn render_blocks_table(f: &mut Frame, area: Rect, seed1: &NodeStats, seed4: &NodeStats) {
+    // Use the node at higher height (or seed1 by default) for block data.
+    let node = if seed4.blocks > seed1.blocks {
+        seed4
+    } else {
+        seed1
+    };
+
+    let header = Line::from(vec![Span::styled(
+        format!(
+            "{:<8} {:<20} {:>5} {:>8} {:>8}  {}",
+            "Height", "Hash", "Txs", "Size", "Time", "Miner"
+        ),
+        Style::default().add_modifier(Modifier::BOLD),
+    )]);
+
+    let mut lines = vec![header];
+
+    if node.recent_blocks.is_empty() {
+        lines.push(Line::from("  Fetching..."));
+    } else {
+        for b in node.recent_blocks.iter().take(5) {
+            let hash_short = shorten_hash(&b.hash, 8);
+            let age = format_age(b.time_ago_secs);
+            let size = format_size(b.size_bytes);
+            let miner = shorten_addr(&b.miner, 6);
+            lines.push(Line::from(format!(
+                "#{:<7} {:<20} {:>5} {:>8} {:>8}  {}",
+                b.height, hash_short, b.n_tx, size, age, miner
+            )));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Latest Blocks"),
+    );
+    f.render_widget(paragraph, area);
+}
+
+fn render_txs_table(f: &mut Frame, area: Rect, seed1: &NodeStats, seed4: &NodeStats) {
+    let node = if seed4.blocks > seed1.blocks {
+        seed4
+    } else {
+        seed1
+    };
+
+    let header = Line::from(vec![Span::styled(
+        format!(
+            "{:<20} {:<16} {:>14}  {}",
+            "TxID", "From", "Amount (FRR)", "Status"
+        ),
+        Style::default().add_modifier(Modifier::BOLD),
+    )]);
+
+    let mut lines = vec![header];
+
+    if node.recent_txs.is_empty() {
+        lines.push(Line::from("  Fetching..."));
+    } else {
+        for tx in node.recent_txs.iter().take(6) {
+            let txid_short = shorten_hash(&tx.txid, 8);
+            let from = if tx.from == "COINBASE" {
+                "COINBASE        ".to_string()
+            } else {
+                format!("{:<16}", tx.from)
+            };
+            lines.push(Line::from(format!(
+                "{:<20} {:<16} {:>14.8}  CONFIRMED",
+                txid_short, from, tx.amount_frr
+            )));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Latest Transactions"),
+    );
+    f.render_widget(paragraph, area);
+}
+
+fn render_summary_row(f: &mut Frame, area: Rect, seed1: &NodeStats, seed4: &NodeStats) {
+    let height_diff = seed1.blocks.abs_diff(seed4.blocks);
+    let tip_match = seed1.reachable
+        && seed4.reachable
+        && !seed1.best_hash.is_empty()
+        && (seed1.blocks != seed4.blocks || seed1.best_hash == seed4.best_hash);
+
+    let combined_peers = match (seed1.peer_count, seed4.peer_count) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        _ => None,
+    };
+
+    let peers_line = match combined_peers {
+        Some(n) => n.to_string(),
+        None => "N/A".to_string(),
+    };
+
+    let tip_status = if tip_match { "MATCH" } else { "FORK" };
+    let tip_style = if tip_match {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+
+    let now = now_unix_secs();
+    let last_block_seed1 = seed1
+        .recent_blocks
+        .first()
+        .map(|b| now.saturating_sub(b.block_time))
+        .or(seed1.last_block_age_secs);
+    let last_block_seed4 = seed4
+        .recent_blocks
+        .first()
+        .map(|b| now.saturating_sub(b.block_time))
+        .or(seed4.last_block_age_secs);
+
+    let last_block_line = format!(
+        "Last block age (s): seed1={}  seed4={}",
+        last_block_seed1
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "N/A".to_string()),
+        last_block_seed4
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "N/A".to_string())
+    );
+
+    let rec_seed1 = match seed1.partition_detected {
+        Some(true) => format!(
+            "seed1=PARTITION attempts={} age={}",
+            seed1.recovery_attempts.unwrap_or(0),
+            seed1.last_block_age_secs.unwrap_or(0)
+        ),
+        Some(false) => format!(
+            "seed1=OK attempts={} age={}",
+            seed1.recovery_attempts.unwrap_or(0),
+            seed1.last_block_age_secs.unwrap_or(0)
+        ),
+        None => "seed1=N/A".to_string(),
+    };
+    let rec_seed4 = match seed4.partition_detected {
+        Some(true) => format!(
+            "seed4=PARTITION attempts={} age={}",
+            seed4.recovery_attempts.unwrap_or(0),
+            seed4.last_block_age_secs.unwrap_or(0)
+        ),
+        Some(false) => format!(
+            "seed4=OK attempts={} age={}",
+            seed4.recovery_attempts.unwrap_or(0),
+            seed4.last_block_age_secs.unwrap_or(0)
+        ),
+        None => "seed4=N/A".to_string(),
+    };
+
+    let net_seed1 = match seed1.connections {
+        Some(c) => format!("seed1 conn={}", c),
+        None => "seed1 conn=N/A".to_string(),
+    };
+    let net_seed4 = match seed4.connections {
+        Some(c) => format!("seed4 conn={}", c),
+        None => "seed4 conn=N/A".to_string(),
+    };
+
+    let rtt_seed1 = seed1
+        .rpc_rtt_ms
+        .map(|v| format!("seed1={}ms", v))
+        .unwrap_or_else(|| "seed1=N/A".to_string());
+    let rtt_seed4 = seed4
+        .rpc_rtt_ms
+        .map(|v| format!("seed4={}ms", v))
+        .unwrap_or_else(|| "seed4=N/A".to_string());
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "Network Summary",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  Tip: "),
+            Span::styled(tip_status, tip_style),
+        ]),
+        Line::from(format!(
+            "seed1: {}  |  seed4: {}  |  Difference: {}",
+            seed1.blocks, seed4.blocks, height_diff
+        )),
+        Line::from(format!(
+            "Peers: seed1={} seed4={}  |  Combined: {}",
+            seed1
+                .peer_count
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "N/A".to_string()),
+            seed4
+                .peer_count
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "N/A".to_string()),
+            peers_line
+        )),
+        Line::from(format!("P2P connections: {}  {}", net_seed1, net_seed4)),
+        Line::from(last_block_line),
+        Line::from(format!("Recovery: {}  {}", rec_seed1, rec_seed4)),
+        Line::from(format!("RPC RTT: {}  {}", rtt_seed1, rtt_seed4)),
+    ];
+
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
+    f.render_widget(paragraph, area);
+}
+
+fn render_footer(f: &mut Frame, area: Rect, last_updated_at: SystemTime) {
+    let line = Line::from(vec![
+        Span::raw(format!(
+            "Last updated: {}  |  ",
+            format_hhmmss(last_updated_at)
+        )),
+        Span::styled(
+            "Press q to quit",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let paragraph = Paragraph::new(line);
+    f.render_widget(paragraph, area);
+}
+
+fn spawn_poller(
+    tx: mpsc::Sender<NodeUpdate>,
+    stop: Arc<AtomicBool>,
+    name: String,
+    ip: String,
+    local_port: u16,
+    auth: Option<String>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last_good = default_node_stats(&name, &ip, local_port);
+        let mut consecutive_failures: u32 = 0;
+        let mut last_poll_at = Instant::now();
+
+        while !stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            let delta_secs = now
+                .duration_since(last_poll_at)
+                .as_secs()
+                .min(u64::from(u32::MAX));
+            last_poll_at = now;
+
+            let (stats, ok) = poll_node(
+                &name,
+                &ip,
+                local_port,
+                Some((&last_good, delta_secs)),
+                auth.as_deref(),
+            );
+            if ok {
+                consecutive_failures = 0;
+                last_good = stats.clone();
+                let _ = tx.send(NodeUpdate {
+                    name: name.clone(),
+                    stats,
+                });
+            } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures < 3 && last_good.reachable {
+                    // Keep showing last good data, just update error
+                    let mut carry = last_good_snapshot(&last_good, delta_secs);
+                    carry.mining_error = stats.mining_error.clone();
+                    carry.blocks_error = stats.blocks_error.clone();
+                    let _ = tx.send(NodeUpdate {
+                        name: name.clone(),
+                        stats: carry,
+                    });
+                } else {
+                    let _ = tx.send(NodeUpdate {
+                        name: name.clone(),
+                        stats,
+                    });
+                }
+            }
+
+            // Poll every 5 seconds
+            for _ in 0..50 {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    })
+}
+
+fn poll_node(
+    name: &str,
+    ip: &str,
+    local_port: u16,
+    prior: Option<(&NodeStats, u64)>,
+    auth: Option<&str>,
+) -> (NodeStats, bool) {
+    let mut stats = default_node_stats(name, ip, local_port);
+    stats.last_updated = Instant::now();
+
+    if !is_port_reachable(local_port) {
+        stats.reachable = false;
+        return (stats, false);
+    }
+
+    // getblockchaininfo
+    let t0 = Instant::now();
+    let info = match rpc_call(local_port, "getblockchaininfo", Value::Array(vec![]), auth) {
+        Ok(v) => v,
+        Err(e) => {
+            stats.reachable = false;
+            stats.blocks_error = Some(format!("RPC: {}", e));
+            return (stats, false);
+        }
+    };
+    stats.rpc_rtt_ms = Some(t0.elapsed().as_millis() as u64);
+
+    stats.reachable = true;
+    stats.chain = info
+        .get("chain")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    stats.blocks = info.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    stats.headers = info.get("headers").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    stats.best_hash = info
+        .get("bestblockhash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // getpeerinfo
+    if let Ok(v) = rpc_call(local_port, "getpeerinfo", Value::Array(vec![]), auth) {
+        if let Some(arr) = v.as_array() {
+            stats.peer_count = Some(arr.len() as u32);
+        } else if let Some(obj) = v.as_object() {
+            if let Some(count) = obj.get("count").and_then(|c| c.as_u64()) {
+                stats.peer_count = Some(count as u32);
+            } else if let Some(peers) = obj.get("peers").and_then(|p| p.as_array()) {
+                stats.peer_count = Some(peers.len() as u32);
+            }
+        }
+    }
+
+    // getmininginfo — difficulty and hashrate come from here
+    match rpc_call(local_port, "getmininginfo", Value::Array(vec![]), auth) {
+        Ok(v) => {
+            stats.difficulty = v
+                .get("difficulty")
+                .and_then(|d| d.as_f64())
+                .unwrap_or(f64::NAN);
+            stats.hash_rate = v
+                .get("hashrate")
+                .or_else(|| v.get("networkhashps"))
+                .or_else(|| v.get("hash_rate"))
+                .and_then(|h| h.as_f64())
+                .unwrap_or(f64::NAN);
+            stats.mining_error = None;
+        }
+        Err(e) => {
+            stats.mining_error = Some(format!("Mining: getmininginfo unavailable ({})", e));
+
+            if !stats.best_hash.is_empty() {
+                if let Ok(block) = rpc_call(local_port, "getblock", json!([stats.best_hash]), auth)
+                {
+                    if let Some(bits_hex) = block.get("bits").and_then(|b| b.as_str()) {
+                        if let Ok(bits) = u32::from_str_radix(bits_hex, 16) {
+                            if let Some(d) = difficulty_from_compact(bits) {
+                                stats.difficulty = d;
+                                stats.hash_rate = d * 4294967296.0 / 150.0;
+                                stats.mining_error = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    match rpc_call(local_port, "getnetworkinfo", Value::Array(vec![]), auth) {
+        Ok(v) => {
+            stats.connections = v
+                .get("connections")
+                .and_then(|n| n.as_u64())
+                .map(|n| n as u32);
+            stats.connections_in = v
+                .get("connections_in")
+                .and_then(|n| n.as_u64())
+                .map(|n| n as u32);
+            stats.connections_out = v
+                .get("connections_out")
+                .and_then(|n| n.as_u64())
+                .map(|n| n as u32);
+            stats.send_rate_mbps = v.get("send_rate_mbps").and_then(|n| n.as_f64());
+            stats.recv_rate_mbps = v.get("recv_rate_mbps").and_then(|n| n.as_f64());
+            stats.uptime_secs = v.get("uptime").and_then(|n| n.as_u64());
+            stats.network_error = None;
+        }
+        Err(e) => {
+            stats.network_error = Some(format!("Network: getnetworkinfo unavailable ({})", e));
+        }
+    }
+
+    match rpc_call(local_port, "getrecoverystatus", Value::Array(vec![]), auth) {
+        Ok(v) => {
+            stats.partition_detected = v.get("partition_detected").and_then(|b| b.as_bool());
+            stats.recovery_attempts = v
+                .get("recovery_attempts")
+                .and_then(|n| n.as_u64())
+                .map(|n| n as u32);
+            stats.last_block_age_secs = v.get("last_block_age").and_then(|n| n.as_u64());
+            stats.recovery_error = None;
+        }
+        Err(e) => {
+            stats.recovery_error = Some(format!("Recovery: getrecoverystatus unavailable ({})", e));
+        }
+    }
+
+    // Recent blocks — only refresh when height changes, non-blocking failures kept separate
+    let need_refresh = match prior {
+        Some((prev, _)) => prev.blocks != stats.blocks || prev.recent_blocks.is_empty(),
+        None => true,
+    };
+
+    if need_refresh {
+        // Try to fetch recent blocks — failure here does NOT make node OFFLINE
+        match fetch_recent_blocks(local_port, stats.blocks, 10, auth) {
+            Ok((recent, txs)) => {
+                stats.recent_blocks = recent;
+                stats.recent_txs = txs;
+                stats.blocks_error = None;
+            }
+            Err(e) => {
+                // Keep last known recent blocks if available
+                if let Some((prev, delta)) = prior {
+                    if !prev.recent_blocks.is_empty() {
+                        stats.recent_blocks = prev
+                            .recent_blocks
+                            .iter()
+                            .map(|b| RecentBlock {
+                                height: b.height,
+                                hash: b.hash.clone(),
+                                block_time: b.block_time,
+                                time_ago_secs: b.time_ago_secs.saturating_add(delta),
+                                n_tx: b.n_tx,
+                                size_bytes: b.size_bytes,
+                                miner: b.miner.clone(),
+                            })
+                            .collect();
+                        stats.recent_txs = prev.recent_txs.clone();
+                    }
+                }
+                stats.blocks_error = Some(format!("Blocks: {}", e));
+            }
+        }
+    } else if let Some((prev, delta)) = prior {
+        stats.recent_blocks = prev
+            .recent_blocks
+            .iter()
+            .map(|b| RecentBlock {
+                height: b.height,
+                hash: b.hash.clone(),
+                block_time: b.block_time,
+                time_ago_secs: b.time_ago_secs.saturating_add(delta),
+                n_tx: b.n_tx,
+                size_bytes: b.size_bytes,
+                miner: b.miner.clone(),
+            })
+            .collect();
+        stats.recent_txs = prev.recent_txs.clone();
+        stats.blocks_error = None;
+    }
+
+    (stats, true)
+}
+
+fn fetch_recent_blocks(
+    local_port: u16,
+    tip_height: u32,
+    count: usize,
+    auth: Option<&str>,
+) -> Result<(Vec<RecentBlock>, Vec<RecentTx>), String> {
+    let now = now_unix_secs();
+    let heights: Vec<u32> = (0..count)
+        .map(|i| tip_height.saturating_sub(i as u32))
+        .collect();
+
+    // Batch getblockhash requests.
+    let mut reqs = Vec::with_capacity(heights.len());
+    for (i, height) in heights.iter().copied().enumerate() {
+        reqs.push(json!({
+            "jsonrpc": "2.0",
+            "method": "getblockhash",
+            "params": [height],
+            "id": (i as u64) + 1
+        }));
+    }
+    let responses = rpc_batch(local_port, Value::Array(reqs), auth)?;
+    let mut by_id: HashMap<u64, Value> = HashMap::with_capacity(responses.len());
+    for r in responses {
+        if let Some(id) = r.get("id").and_then(|v| v.as_u64()) {
+            by_id.insert(id, r);
+        }
+    }
+    let mut hashes: Vec<String> = Vec::with_capacity(heights.len());
+    for i in 0..heights.len() {
+        let id = (i as u64) + 1;
+        let resp = by_id
+            .get(&id)
+            .ok_or_else(|| format!("Missing batch response for id {}", id))?;
+        if resp.get("error").is_some() {
+            return Err(resp.to_string());
+        }
+        let hash = resp
+            .get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if hash.is_empty() {
+            break;
+        }
+        hashes.push(hash);
+    }
+
+    // Batch verbose getblock requests.
+    let mut block_reqs = Vec::with_capacity(hashes.len());
+    for (i, hash) in hashes.iter().enumerate() {
+        block_reqs.push(json!({
+            "jsonrpc": "2.0",
+            "method": "getblock",
+            "params": [hash, true],
+            "id": 1000u64 + (i as u64)
+        }));
+    }
+    let block_responses = rpc_batch(local_port, Value::Array(block_reqs), auth)?;
+    let mut blocks_by_id: HashMap<u64, Value> = HashMap::with_capacity(block_responses.len());
+    for r in block_responses {
+        if let Some(id) = r.get("id").and_then(|v| v.as_u64()) {
+            blocks_by_id.insert(id, r);
+        }
+    }
+
+    let mut recent_blocks: Vec<RecentBlock> = Vec::with_capacity(hashes.len());
+    let mut recent_txs: Vec<RecentTx> = Vec::new();
+
+    for (i, height) in heights.iter().copied().enumerate() {
+        let id = 1000u64 + (i as u64);
+        let resp = match blocks_by_id.get(&id) {
+            Some(r) => r,
+            None => break,
+        };
+        if resp.get("error").is_some() {
+            return Err(resp.to_string());
+        }
+        let block = resp
+            .get("result")
+            .cloned()
+            .ok_or_else(|| "Missing result".to_string())?;
+
+        let block_hash = block
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let block_height = block
+            .get("height")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(height as u64);
+        let time = block.get("time").and_then(|v| v.as_u64()).unwrap_or(0);
+        let time_ago = now.saturating_sub(time);
+        let n_tx = block.get("n_tx").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let size_bytes = block.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        let miner = block
+            .get("miner")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        recent_blocks.push(RecentBlock {
+            height: block_height as u32,
+            hash: block_hash,
+            block_time: time,
+            time_ago_secs: time_ago,
+            n_tx,
+            size_bytes,
+            miner,
+        });
+
+        // Collect transactions from the first few blocks only (avoid flooding the tx table).
+        if recent_txs.len() < 20 {
+            if let Some(txs) = block.get("transactions").and_then(|v| v.as_array()) {
+                for tx in txs {
+                    let txid = tx
+                        .get("txid")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let is_coinbase = tx
+                        .get("is_coinbase")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let from = if is_coinbase {
+                        "COINBASE".to_string()
+                    } else {
+                        tx.get("vin")
+                            .and_then(|v| v.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|inp| inp.get("txid"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| format!("{}...{}", &s[..6], &s[s.len().saturating_sub(4)..]))
+                            .unwrap_or_else(|| "unknown".to_string())
+                    };
+                    // For coinbase: sum all outputs (block reward).
+                    // For regular txs: show only vout[0] (the payment); vout[1] is change.
+                    let amount_frr: f64 = if is_coinbase {
+                        tx.get("vout")
+                            .and_then(|v| v.as_array())
+                            .map(|outputs| {
+                                outputs
+                                    .iter()
+                                    .filter_map(|o| o.get("value_frr").and_then(|v| v.as_f64()))
+                                    .sum()
+                            })
+                            .unwrap_or(0.0)
+                    } else {
+                        tx.get("vout")
+                            .and_then(|v| v.as_array())
+                            .and_then(|outputs| outputs.first())
+                            .and_then(|o| o.get("value_frr"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0)
+                    };
+                    if !txid.is_empty() {
+                        recent_txs.push(RecentTx {
+                            txid,
+                            from,
+                            amount_frr,
+                        });
+                    }
+                    if recent_txs.len() >= 20 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((recent_blocks, recent_txs))
+}
+
+fn default_node_stats(name: &str, ip: &str, rpc_port: u16) -> NodeStats {
+    NodeStats {
+        name: name.to_string(),
+        ip: ip.to_string(),
+        rpc_port,
+        blocks: 0,
+        headers: 0,
+        best_hash: String::new(),
+        chain: "unknown".to_string(),
+        difficulty: f64::NAN,
+        hash_rate: f64::NAN,
+        peer_count: None,
+        connections: None,
+        connections_in: None,
+        connections_out: None,
+        send_rate_mbps: None,
+        recv_rate_mbps: None,
+        uptime_secs: None,
+        partition_detected: None,
+        recovery_attempts: None,
+        last_block_age_secs: None,
+        rpc_rtt_ms: None,
+        recent_blocks: Vec::new(),
+        recent_txs: Vec::new(),
+        reachable: false,
+        last_updated: Instant::now(),
+        mining_error: None,
+        blocks_error: None,
+        network_error: None,
+        recovery_error: None,
+    }
+}
+
+fn last_good_snapshot(prev: &NodeStats, delta_secs: u64) -> NodeStats {
+    let mut s = default_node_stats(&prev.name, &prev.ip, prev.rpc_port);
+    s.blocks = prev.blocks;
+    s.headers = prev.headers;
+    s.best_hash = prev.best_hash.clone();
+    s.chain = prev.chain.clone();
+    s.difficulty = prev.difficulty;
+    s.hash_rate = prev.hash_rate;
+    s.peer_count = prev.peer_count;
+    s.connections = prev.connections;
+    s.connections_in = prev.connections_in;
+    s.connections_out = prev.connections_out;
+    s.send_rate_mbps = prev.send_rate_mbps;
+    s.recv_rate_mbps = prev.recv_rate_mbps;
+    s.uptime_secs = prev.uptime_secs;
+    s.partition_detected = prev.partition_detected;
+    s.recovery_attempts = prev.recovery_attempts;
+    s.last_block_age_secs = prev
+        .last_block_age_secs
+        .map(|a| a.saturating_add(delta_secs));
+    s.rpc_rtt_ms = prev.rpc_rtt_ms;
+    s.reachable = prev.reachable;
+    s.last_updated = prev.last_updated;
+    s.recent_blocks = prev
+        .recent_blocks
+        .iter()
+        .map(|b| RecentBlock {
+            height: b.height,
+            hash: b.hash.clone(),
+            block_time: b.block_time,
+            time_ago_secs: b.time_ago_secs.saturating_add(delta_secs),
+            n_tx: b.n_tx,
+            size_bytes: b.size_bytes,
+            miner: b.miner.clone(),
+        })
+        .collect();
+    s.recent_txs = prev.recent_txs.clone();
+    s
+}
+
+fn rpc_call(
+    local_port: u16,
+    method: &str,
+    params: Value,
+    auth: Option<&str>,
+) -> Result<Value, String> {
+    let req = json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+        "id": 1
+    });
+    let resp = http_post_json(local_port, &req.to_string(), auth)?;
+
+    if resp.get("error").is_some() {
+        return Err(resp.to_string());
+    }
+
+    resp.get("result")
+        .cloned()
+        .ok_or_else(|| "Missing result".to_string())
+}
+
+fn rpc_batch(local_port: u16, requests: Value, auth: Option<&str>) -> Result<Vec<Value>, String> {
+    let resp = http_post_json(local_port, &requests.to_string(), auth)?;
+    match resp {
+        Value::Array(items) => Ok(items),
+        other => Ok(vec![other]),
+    }
+}
+
+fn http_post_json(local_port: u16, body: &str, auth: Option<&str>) -> Result<Value, String> {
+    let mut stream =
+        TcpStream::connect_timeout(&local_socket_addr(local_port), Duration::from_secs(5))
+            .map_err(|e| format!("{}", e))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(20)));
+
+    let auth_header = match auth {
+        Some(b64) => format!("Authorization: Basic {}\r\n", b64),
+        None => String::new(),
+    };
+
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n{auth}Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+        port = local_port,
+        auth = auth_header,
+        len = body.len(),
+        body = body
+    );
+
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("{}", e))?;
+    stream.flush().map_err(|e| format!("{}", e))?;
+
+    let mut resp_bytes = Vec::new();
+    stream
+        .read_to_end(&mut resp_bytes)
+        .map_err(|e| format!("{}", e))?;
+
+    let resp_str = String::from_utf8_lossy(&resp_bytes);
+    let mut parts = resp_str.splitn(2, "\r\n\r\n");
+    let header = parts.next().unwrap_or("");
+    let body = parts.next().unwrap_or("");
+
+    if header.contains("401") {
+        return Err("HTTP 401 Unauthorized (cookie mismatch or missing)".to_string());
+    }
+    if !header.contains("200") {
+        return Err(format!(
+            "HTTP error: {}",
+            header.lines().next().unwrap_or("")
+        ));
+    }
+
+    serde_json::from_str(body).map_err(|e| format!("JSON parse error: {:?}", e))
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs()
+}
+
+fn format_hhmmss(_t: SystemTime) -> String {
+    let now = chrono::Local::now();
+    now.format("%H:%M:%S").to_string()
+}
+
+fn local_socket_addr(port: u16) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+}
+
+fn is_port_reachable(port: u16) -> bool {
+    TcpStream::connect_timeout(&local_socket_addr(port), Duration::from_secs(1)).is_ok()
+}
+
+fn difficulty_from_compact(bits: u32) -> Option<f64> {
+    if bits == 0 {
+        return None;
+    }
+    let exponent = ((bits >> 24) & 0xff) as i32;
+    let mantissa_u32 = bits & 0x00ff_ffff;
+    if mantissa_u32 == 0 {
+        return None;
+    }
+
+    let mantissa = mantissa_u32 as f64;
+    let target = mantissa * 2f64.powi(8 * (exponent - 3));
+
+    let diff1_mantissa = 0x0000ffffu32 as f64;
+    let diff1_exponent = 0x1d_i32;
+    let diff1_target = diff1_mantissa * 2f64.powi(8 * (diff1_exponent - 3));
+
+    Some(diff1_target / target)
+}

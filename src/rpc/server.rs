@@ -1,0 +1,1353 @@
+use crate::consensus::chain::ChainState;
+use crate::mining::Miner;
+use crate::network::diagnostics::NetworkDiagnostics;
+use crate::network::manager::PeerManager;
+use crate::network::mempool::NetworkMempool;
+use crate::network::recovery::RecoveryManager;
+use crate::network::relay::BlockRelay;
+use crate::network::stats::NetworkStats;
+use crate::primitives::serialize::{Decode, Encode};
+use crate::primitives::varint;
+use crate::rpc::methods::*;
+use crate::wallet::address::script_pubkey_to_address;
+use crate::wallet::bip39;
+use crate::wallet::builder::TransactionBuilder;
+use crate::wallet::manager::Wallet;
+use crate::wallet::shamir;
+use serde_json::{json, Value};
+use std::io::Read;
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use tiny_http::{Response, Server};
+
+pub struct RpcServerConfig {
+    pub chain: Arc<RwLock<ChainState>>,
+    pub miner: Arc<Miner>,
+    pub wallet: Arc<Mutex<Wallet>>,
+    pub peer_manager: Arc<PeerManager>,
+    pub network_stats: Arc<NetworkStats>,
+    pub recovery_manager: Arc<RecoveryManager>,
+    pub relay: Arc<BlockRelay>,
+    pub mempool: Arc<NetworkMempool>,
+    pub network_prefix: u8,
+    /// If Some("user:pass"), every request must carry a matching HTTP Basic Auth header.
+    /// None disables auth (used in tests and regtest).
+    pub rpc_auth: Option<String>,
+}
+
+pub struct RpcServer {
+    chain: Arc<RwLock<ChainState>>,
+    miner: Arc<Miner>,
+    wallet: Arc<Mutex<Wallet>>,
+    peer_manager: Arc<PeerManager>,
+    network_stats: Arc<NetworkStats>,
+    recovery_manager: Arc<RecoveryManager>,
+    relay: Arc<BlockRelay>,
+    mempool: Arc<NetworkMempool>,
+    network_prefix: u8,
+    rpc_auth: Option<String>,
+    server: Server,
+    /// 1-second response cache for getblockchaininfo (timestamp, cached value).
+    blockchain_info_cache: Mutex<Option<(Instant, Value)>>,
+    /// 1-second response cache for getmininginfo (timestamp, cached value).
+    mininginfo_cache: Mutex<Option<(Instant, Value)>>,
+}
+
+impl RpcServer {
+    pub fn new(config: RpcServerConfig, addr: &str) -> Result<Self, String> {
+        let server = Server::http(addr).map_err(|e| format!("Failed to start server: {}", e))?;
+
+        Ok(Self {
+            chain: config.chain,
+            miner: config.miner,
+            wallet: config.wallet,
+            peer_manager: config.peer_manager,
+            network_stats: config.network_stats,
+            recovery_manager: config.recovery_manager,
+            relay: config.relay,
+            mempool: config.mempool,
+            network_prefix: config.network_prefix,
+            rpc_auth: config.rpc_auth,
+            server,
+            blockchain_info_cache: Mutex::new(None),
+            mininginfo_cache: Mutex::new(None),
+        })
+    }
+
+    pub fn run(self: Arc<Self>) -> Result<(), String> {
+        // Cap concurrent RPC threads so a flood of requests (txgen, monitor)
+        // cannot create unbounded OS threads. At 150s PoW per mineblocks call,
+        // 16 slots is far more than normal load ever needs.
+        const MAX_RPC_THREADS: usize = 16;
+        let semaphore = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for mut request in self.server.incoming_requests() {
+            if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            // Acquire a slot — block the accept loop until one is free.
+            {
+                let (lock, cvar) = &*semaphore;
+                let mut count = lock.lock().unwrap();
+                while *count >= MAX_RPC_THREADS {
+                    count = cvar.wait(count).unwrap();
+                }
+                *count += 1;
+            }
+            let server = Arc::clone(&self);
+            let stop_flag = Arc::clone(&stop_flag);
+            let semaphore = Arc::clone(&semaphore);
+            std::thread::spawn(move || {
+                let (response, stop) = server.handle_request(&mut request);
+                let _ = request.respond(response);
+                if stop {
+                    stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Release the slot.
+                let (lock, cvar) = &*semaphore;
+                *lock.lock().unwrap() -= 1;
+                cvar.notify_one();
+            });
+        }
+        Ok(())
+    }
+
+    pub fn handle_raw(&self, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+        self.handle_json_rpc_body(body.as_bytes()).0
+    }
+
+    pub fn handle_json_rpc(&self, req: Value) -> Response<std::io::Cursor<Vec<u8>>> {
+        match self.handle_json_rpc_value(&req).0 {
+            Some(v) => self.json_response(v),
+            None => Response::from_string("").with_status_code(204),
+        }
+    }
+
+    fn handle_json_rpc_body(&self, body: &[u8]) -> (Response<std::io::Cursor<Vec<u8>>>, bool) {
+        let trimmed = self.trim_body(body);
+        let req: Value = match serde_json::from_slice(trimmed) {
+            Ok(Value::String(s)) => match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(_) => {
+                    return (
+                        self.error_response(Value::Null, -32700, "Parse error"),
+                        false,
+                    )
+                }
+            },
+            Ok(v) => v,
+            Err(_) => {
+                let without_nul: Vec<u8> = trimmed.iter().copied().filter(|b| *b != 0).collect();
+                let secondary = if without_nul.len() == trimmed.len() {
+                    trimmed
+                } else {
+                    &without_nul
+                };
+
+                match serde_json::from_slice::<Value>(secondary) {
+                    Ok(Value::String(s)) => match serde_json::from_str(&s) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return (
+                                self.error_response(Value::Null, -32700, "Parse error"),
+                                false,
+                            )
+                        }
+                    },
+                    Ok(v) => v,
+                    Err(_) => {
+                        if let Some(v) = self.try_parse_backslash_escaped_json(secondary) {
+                            v
+                        } else if let Some(v) = self.try_parse_backslash_quote_json(secondary) {
+                            v
+                        } else if let Some(v) = self.try_parse_extracted_json(secondary) {
+                            v
+                        } else {
+                            return (
+                                self.error_response(Value::Null, -32700, "Parse error"),
+                                false,
+                            );
+                        }
+                    }
+                }
+            }
+        };
+
+        match req {
+            Value::Array(items) => {
+                if items.is_empty() {
+                    return (
+                        self.error_response(Value::Null, -32600, "Invalid Request"),
+                        false,
+                    );
+                }
+
+                let mut responses: Vec<Value> = Vec::new();
+                let mut stop = false;
+                for item in &items {
+                    let (resp, should_stop) = self.handle_json_rpc_value(item);
+                    stop |= should_stop;
+                    if let Some(resp) = resp {
+                        responses.push(resp);
+                    }
+                }
+
+                if responses.is_empty() {
+                    return (Response::from_string("").with_status_code(204), stop);
+                }
+
+                (self.json_response(Value::Array(responses)), stop)
+            }
+            other => {
+                let (resp, stop) = self.handle_json_rpc_value(&other);
+                match resp {
+                    Some(v) => (self.json_response(v), stop),
+                    None => (Response::from_string("").with_status_code(204), stop),
+                }
+            }
+        }
+    }
+
+    fn handle_json_rpc_value(&self, req: &Value) -> (Option<Value>, bool) {
+        let Some(obj) = req.as_object() else {
+            return (
+                Some(self.error_value(Value::Null, -32600, "Invalid Request")),
+                false,
+            );
+        };
+
+        let method = obj.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        if method.is_empty() {
+            return (
+                Some(self.error_value(Value::Null, -32600, "Invalid Request")),
+                false,
+            );
+        }
+
+        let stop = method == "stop";
+
+        let id_present = obj.contains_key("id");
+        let id = obj.get("id").cloned().unwrap_or(Value::Null);
+        if !id_present {
+            let _ = self.dispatch_method(method, obj.get("params").unwrap_or(&Value::Null));
+            return (None, stop);
+        }
+
+        let params = obj.get("params").unwrap_or(&Value::Null);
+        match self.dispatch_method(method, params) {
+            Ok(result) => (Some(self.success_value(id, result)), stop),
+            Err((code, message)) => (Some(self.error_value(id, code, message)), stop),
+        }
+    }
+
+    fn dispatch_method(&self, method: &str, params: &Value) -> Result<Value, (i32, String)> {
+        let result = match method {
+            "getblockchaininfo" => self.getblockchaininfo(),
+            "getmininginfo" => self.getmininginfo(),
+            "mineblocks" => self.mineblocks(params),
+            "getblock" => self.getblock(params),
+            "getblockhash" => self.getblockhash(params),
+            "getbestblockhash" => self.getbestblockhash(),
+            "addnode" => self.addnode(params),
+            "getnewaddress" => self.getnewaddress(),
+            "getbalance" => self.getbalance(),
+            "listunspent" => self.listunspent(),
+            "listaddresses" => self.listaddresses(),
+            "sendtoaddress" => self.sendtoaddress(params),
+            "generatetoaddress" => self.generatetoaddress(params),
+            "getnetworkinfo" => self.getnetworkinfo(),
+            "getpeerinfo" => self.getpeerinfo(),
+            "getconnectioncount" => self.getconnectioncount(),
+            "getnetworkhealth" => self.getnetworkhealth(),
+            "getrecoverystatus" => self.getrecoverystatus(),
+            "forcereconnect" => self.forcereconnect(),
+            "resetnetwork" => self.resetnetwork(),
+            "sendrawtransaction" => self.sendrawtransaction(params),
+            "getwalletinfo" => self.getwalletinfo(),
+            "encryptwallet" => self.encryptwallet(params),
+            "importseed" => self.importseed(params),
+            "getshamirshares" => self.getshamirshares(params),
+            "stop" => Ok(json!("stopping")),
+            _ => return Err((-32601, "Method not found".to_string())),
+        };
+
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) => Err((-32603, e)),
+        }
+    }
+
+    fn try_parse_backslash_escaped_json(&self, body: &[u8]) -> Option<Value> {
+        let trimmed = self.trim_body(body);
+        if !(trimmed.starts_with(b"{\\\"") || trimmed.starts_with(b"[{\\\"")) {
+            return None;
+        }
+
+        let mut cleaned = Vec::with_capacity(trimmed.len());
+        let mut i = 0;
+        while i < trimmed.len() {
+            if trimmed[i] == b'\\' && i + 1 < trimmed.len() && trimmed[i + 1] == b'"' {
+                cleaned.push(b'"');
+                i += 2;
+                continue;
+            }
+            cleaned.push(trimmed[i]);
+            i += 1;
+        }
+
+        serde_json::from_slice(&cleaned).ok()
+    }
+
+    fn try_parse_backslash_quote_json(&self, body: &[u8]) -> Option<Value> {
+        if body.contains(&b'"') || !body.contains(&b'\\') {
+            return None;
+        }
+
+        let mut cleaned = Vec::with_capacity(body.len());
+        let mut i = 0;
+        while i < body.len() {
+            if body[i] == b'\\' {
+                if i + 1 < body.len() && body[i + 1] == b':' {
+                    cleaned.push(b'"');
+                    cleaned.push(b':');
+                    i += 2;
+                    continue;
+                }
+                if i + 1 < body.len() && body[i + 1] == b',' {
+                    cleaned.push(b'"');
+                    cleaned.push(b',');
+                    i += 2;
+                    continue;
+                }
+                cleaned.push(b'"');
+                i += 1;
+                continue;
+            }
+            cleaned.push(body[i]);
+            i += 1;
+        }
+
+        serde_json::from_slice(&cleaned).ok()
+    }
+
+    fn try_parse_extracted_json(&self, body: &[u8]) -> Option<Value> {
+        let mut start = None;
+        for (i, b) in body.iter().copied().enumerate() {
+            if b == b'{' || b == b'[' {
+                start = Some(i);
+                break;
+            }
+        }
+        let start = start?;
+
+        let mut end = None;
+        for (i, b) in body.iter().copied().enumerate().rev() {
+            if b == b'}' || b == b']' {
+                end = Some(i);
+                break;
+            }
+        }
+        let end = end?;
+        if end <= start {
+            return None;
+        }
+
+        let slice = &body[start..=end];
+        serde_json::from_slice(slice)
+            .ok()
+            .or_else(|| self.try_parse_backslash_escaped_json(slice))
+            .or_else(|| self.try_parse_backslash_quote_json(slice))
+    }
+
+    fn trim_body<'a>(&self, body: &'a [u8]) -> &'a [u8] {
+        let mut start = 0;
+        while start < body.len() && (body[start].is_ascii_whitespace() || body[start] == 0) {
+            start += 1;
+        }
+        let mut end = body.len();
+        while end > start && (body[end - 1].is_ascii_whitespace() || body[end - 1] == 0) {
+            end -= 1;
+        }
+        &body[start..end]
+    }
+
+    /// Minimal RFC 4648 Base64 decoder (no padding required to be correct, but
+    /// standard padding is accepted).  Returns `None` on any invalid character.
+    fn base64_decode(input: &str) -> Option<Vec<u8>> {
+        const TABLE: &[u8; 128] = b"\
+            \xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\
+            \xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\
+            \xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x3e\xff\xff\xff\x3f\
+            \x34\x35\x36\x37\x38\x39\x3a\x3b\x3c\x3d\xff\xff\xff\xff\xff\xff\
+            \xff\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\
+            \x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\xff\xff\xff\xff\xff\
+            \xff\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x22\x23\x24\x25\x26\x27\x28\
+            \x29\x2a\x2b\x2c\x2d\x2e\x2f\x30\x31\x32\x33\xff\xff\xff\xff\xff";
+        let input = input.trim_end_matches('=');
+        let mut out = Vec::with_capacity(input.len() * 3 / 4 + 1);
+        let mut buf: u32 = 0;
+        let mut bits = 0u32;
+        for &b in input.as_bytes() {
+            if b as usize >= 128 {
+                return None;
+            }
+            let v = TABLE[b as usize];
+            if v == 0xff {
+                return None;
+            }
+            buf = (buf << 6) | v as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+        Some(out)
+    }
+
+    fn unauthorized_response(&self) -> Response<std::io::Cursor<Vec<u8>>> {
+        let body =
+            r#"{"jsonrpc":"2.0","error":{"code":-32600,"message":"Unauthorized"},"id":null}"#;
+        Response::from_string(body)
+            .with_status_code(401)
+            .with_header(
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .unwrap(),
+            )
+            .with_header(
+                tiny_http::Header::from_bytes(
+                    &b"WWW-Authenticate"[..],
+                    &b"Basic realm=\"ferrous-rpc\""[..],
+                )
+                .unwrap(),
+            )
+    }
+
+    fn check_auth(&self, request: &tiny_http::Request) -> bool {
+        let expected = match &self.rpc_auth {
+            Some(s) => s,
+            None => return true,
+        };
+        let header_value = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Authorization"))
+            .map(|h| h.value.as_str());
+        let value = match header_value {
+            Some(v) => v,
+            None => return false,
+        };
+        let encoded = match value.strip_prefix("Basic ") {
+            Some(s) => s.trim(),
+            None => return false,
+        };
+        let decoded = match Self::base64_decode(encoded) {
+            Some(b) => b,
+            None => return false,
+        };
+        let credential = match std::str::from_utf8(&decoded) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        credential == expected.as_str()
+    }
+
+    fn handle_request(
+        &self,
+        request: &mut tiny_http::Request,
+    ) -> (Response<std::io::Cursor<Vec<u8>>>, bool) {
+        const MAX_REQUEST_BODY: usize = 1024 * 1024;
+
+        if !self.check_auth(request) {
+            return (self.unauthorized_response(), false);
+        }
+
+        if request.method() != &tiny_http::Method::Post {
+            return (
+                self.error_response(Value::Null, -32600, "Invalid Request")
+                    .with_status_code(405),
+                false,
+            );
+        }
+
+        let mut buf = Vec::new();
+        match request.body_length() {
+            Some(len) if len > 0 => {
+                if len > MAX_REQUEST_BODY {
+                    return (
+                        self.error_response(Value::Null, -32600, "Request too large"),
+                        false,
+                    );
+                }
+                buf.resize(len, 0);
+                if request.as_reader().read_exact(&mut buf).is_err() {
+                    return (
+                        self.error_response(Value::Null, -32700, "Parse error"),
+                        false,
+                    );
+                }
+            }
+            _ => {
+                let mut reader = request.as_reader().take((MAX_REQUEST_BODY + 1) as u64);
+                if reader.read_to_end(&mut buf).is_err() {
+                    return (
+                        self.error_response(Value::Null, -32700, "Parse error"),
+                        false,
+                    );
+                }
+                if buf.len() > MAX_REQUEST_BODY {
+                    return (
+                        self.error_response(Value::Null, -32600, "Request too large"),
+                        false,
+                    );
+                }
+            }
+        }
+
+        if buf.is_empty() {
+            return (
+                self.error_response(Value::Null, -32700, "Parse error"),
+                false,
+            );
+        }
+
+        self.handle_json_rpc_body(&buf)
+    }
+
+    fn getnetworkinfo(&self) -> Result<Value, String> {
+        let stats = self.network_stats.get_snapshot();
+        let connections = self.peer_manager.get_peer_count();
+
+        Ok(json!({
+            "version": 70001,
+            "connections": connections,
+            "connections_in": stats.total_connections_accepted,
+            "connections_out": stats.total_connections_initiated,
+            "bytes_sent": stats.bytes_sent,
+            "bytes_recv": stats.bytes_received,
+            "send_rate_mbps": (stats.avg_send_rate * 8.0) / 1_000_000.0,
+            "recv_rate_mbps": (stats.avg_recv_rate * 8.0) / 1_000_000.0,
+            "uptime": stats.uptime_secs,
+        }))
+    }
+
+    fn getpeerinfo(&self) -> Result<Value, String> {
+        let count = self.peer_manager.get_peer_count();
+        let addrs = self.peer_manager.get_peer_addrs();
+
+        // Return simple list for now
+        let info: Vec<_> = addrs.iter().map(|a| a.to_string()).collect();
+        Ok(json!({
+            "count": count,
+            "peers": info
+        }))
+    }
+
+    fn getconnectioncount(&self) -> Result<Value, String> {
+        let diagnostics = NetworkDiagnostics::new(self.peer_manager.clone());
+        let summary = diagnostics.get_connection_summary();
+        Ok(json!(summary.total_peers))
+    }
+
+    fn getnetworkhealth(&self) -> Result<Value, String> {
+        let diagnostics = NetworkDiagnostics::new(self.peer_manager.clone());
+        let health_score = diagnostics.get_health_score();
+
+        Ok(json!({
+            "health_score": health_score,
+            "status": if health_score >= 80 { "excellent" }
+                      else if health_score >= 60 { "good" }
+                      else if health_score >= 40 { "fair" }
+                      else { "poor" },
+        }))
+    }
+
+    fn getrecoverystatus(&self) -> Result<Value, String> {
+        Ok(json!({
+            "partition_detected": self.recovery_manager.is_partitioned(),
+            "recovery_attempts": self.recovery_manager.get_attempts(),
+            "last_block_age": self.recovery_manager.get_last_block_age_secs(),
+        }))
+    }
+
+    fn forcereconnect(&self) -> Result<Value, String> {
+        self.recovery_manager.force_reconnect();
+        Ok(json!({"result": "reconnecting"}))
+    }
+
+    fn resetnetwork(&self) -> Result<Value, String> {
+        match self.recovery_manager.recover() {
+            Ok(_) => Ok(json!({"result": "network reset initiated"})),
+            Err(e) => Err(format!("Network reset failed: {}", e)),
+        }
+    }
+
+    fn sendrawtransaction(&self, params: &Value) -> Result<Value, String> {
+        let hex_str = params
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .ok_or("Invalid hex")?;
+
+        let raw = hex::decode(hex_str).map_err(|_| "Invalid hex".to_string())?;
+
+        let (tx, _) = crate::consensus::transaction::Transaction::decode(&raw)
+            .map_err(|_| "Failed to decode transaction".to_string())?;
+
+        tx.check_structure()
+            .map_err(|e| format!("Invalid transaction: {:?}", e))?;
+
+        let txid = tx.txid();
+
+        match self.mempool.add_transaction(tx) {
+            Ok(_) => Ok(json!(hex::encode(txid))),
+            Err(e) => Err(format!("Mempool rejected: {}", e)),
+        }
+    }
+
+    fn getblockchaininfo(&self) -> Result<Value, String> {
+        // Serve from cache if the entry is less than 1 second old.
+        {
+            let cache = self.blockchain_info_cache.lock().unwrap();
+            if let Some((ts, ref v)) = *cache {
+                if ts.elapsed() < Duration::from_secs(1) {
+                    return Ok(v.clone());
+                }
+            }
+        }
+
+        let chain = match self.chain.try_read() {
+            Ok(c) => c,
+            Err(_) => {
+                let cache = self.blockchain_info_cache.lock().unwrap();
+                if let Some((_, ref v)) = *cache {
+                    return Ok(v.clone());
+                }
+                return Err("Chain busy".to_string());
+            }
+        };
+        let tip = chain.get_tip().map_err(|e| format!("{:?}", e))?;
+
+        let height = tip.as_ref().map(|t| t.height as u32).unwrap_or(0);
+        let bestblockhash = tip
+            .as_ref()
+            .map(|t| hex::encode(t.block.header.hash()))
+            .unwrap_or_else(|| "00".repeat(32));
+
+        let response = GetBlockchainInfoResponse {
+            chain: "ferrous".to_string(),
+            blocks: height,
+            headers: height,
+            bestblockhash,
+        };
+
+        let v =
+            serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))?;
+        *self.blockchain_info_cache.lock().unwrap() = Some((Instant::now(), v.clone()));
+        Ok(v)
+    }
+
+    fn getmininginfo(&self) -> Result<Value, String> {
+        // Serve from cache if the entry is less than 1 second old.
+        {
+            let cache = self.mininginfo_cache.lock().unwrap();
+            if let Some((ts, ref v)) = *cache {
+                if ts.elapsed() < Duration::from_secs(1) {
+                    return Ok(v.clone());
+                }
+            }
+        }
+
+        let chain = match self.chain.try_read() {
+            Ok(c) => c,
+            Err(_) => {
+                let cache = self.mininginfo_cache.lock().unwrap();
+                if let Some((_, ref v)) = *cache {
+                    return Ok(v.clone());
+                }
+                return Err("Chain busy".to_string());
+            }
+        };
+        let tip = chain.get_tip().map_err(|e| format!("{:?}", e))?;
+
+        let blocks = tip.as_ref().map(|t| t.height as u32).unwrap_or(0);
+        let bits = tip.as_ref().map(|t| t.block.header.n_bits).unwrap_or(0);
+
+        let difficulty = difficulty_from_compact(bits).unwrap_or(0.0);
+        let networkhashps = difficulty * 4294967296.0 / self.miner.params.target_block_time as f64;
+        let hashrate = self.miner.hashrate_hps();
+
+        let response = GetMiningInfoResponse {
+            blocks,
+            difficulty,
+            networkhashps,
+            hashrate,
+            chain: "ferrous".to_string(),
+        };
+
+        let v =
+            serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))?;
+        *self.mininginfo_cache.lock().unwrap() = Some((Instant::now(), v.clone()));
+        Ok(v)
+    }
+
+    fn mineblocks(&self, params: &Value) -> Result<Value, String> {
+        let nblocks = params
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_u64())
+            .ok_or("Invalid params: expected [nblocks]")?;
+
+        if nblocks == 0 || nblocks > 1000 {
+            return Err("nblocks must be between 1 and 1000".to_string());
+        }
+
+        let mut block_hashes = Vec::new();
+        let mut last_hash = [0u8; 32];
+
+        for _ in 0..nblocks {
+            // Phase 1: build template under read lock.
+            let template = {
+                let chain = self.chain.read().map_err(|_| "Lock poisoned".to_string())?;
+                self.miner
+                    .build_template(&chain, Vec::new())
+                    .map_err(|e| format!("Template build failed: {:?}", e))?
+            };
+            // Phase 2: PoW — no chain lock.
+            let (header, txs) = self
+                .miner
+                .solve_template(template)
+                .map_err(|e| format!("Mining failed: {:?}", e))?;
+            // Phase 3: commit — write lock briefly.
+            {
+                use crate::consensus::block::Block;
+                let mut chain = self
+                    .chain
+                    .write()
+                    .map_err(|_| "Lock poisoned".to_string())?;
+                chain
+                    .add_block(Block {
+                        header,
+                        transactions: txs,
+                    })
+                    .map_err(|e| format!("add_block failed: {:?}", e))?;
+            }
+            last_hash = header.hash();
+            block_hashes.push(hex::encode(header.hash()));
+        }
+
+        let _ = self.relay.announce_block(last_hash);
+
+        let response = MineBlocksResponse {
+            blocks: block_hashes,
+        };
+
+        serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))
+    }
+
+    fn generatetoaddress(&self, params: &Value) -> Result<Value, String> {
+        let arr = params
+            .as_array()
+            .ok_or("Invalid params: expected [nblocks, address]")?;
+
+        let nblocks = arr
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing nblocks parameter")?;
+
+        if nblocks == 0 || nblocks > 1000 {
+            return Err("nblocks must be between 1 and 1000".to_string());
+        }
+
+        let address = arr
+            .get(1)
+            .and_then(|v| v.as_str())
+            .ok_or("Missing address parameter")?;
+
+        let script = crate::wallet::address::address_to_script_pubkey(address)
+            .map_err(|e| format!("Invalid address: {}", e))?;
+
+        let mut block_hashes = Vec::new();
+        let mut last_hash = [0u8; 32];
+
+        for _ in 0..nblocks {
+            // Phase 1: build template under read lock.
+            let template = {
+                let chain = self
+                    .chain
+                    .read()
+                    .map_err(|_| "Chain lock failed".to_string())?;
+                self.miner
+                    .build_template_to(&chain, Vec::new(), script.clone())
+                    .map_err(|e| format!("Template build failed: {:?}", e))?
+            };
+            // Phase 2: PoW — no chain lock.
+            let (header, txs) = self
+                .miner
+                .solve_template(template)
+                .map_err(|e| format!("Mining failed: {:?}", e))?;
+            // Phase 3: commit — write lock briefly.
+            {
+                use crate::consensus::block::Block;
+                let mut chain = self
+                    .chain
+                    .write()
+                    .map_err(|_| "Chain lock failed".to_string())?;
+                chain
+                    .add_block(Block {
+                        header,
+                        transactions: txs,
+                    })
+                    .map_err(|e| format!("add_block failed: {:?}", e))?;
+            }
+            last_hash = header.hash();
+            block_hashes.push(hex::encode(header.hash()));
+        }
+
+        let _ = self.relay.announce_block(last_hash);
+
+        let response = MineBlocksResponse {
+            blocks: block_hashes,
+        };
+
+        serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))
+    }
+
+    fn getnewaddress(&self) -> Result<Value, String> {
+        let mut wallet = self
+            .wallet
+            .lock()
+            .map_err(|_| "Lock poisoned".to_string())?;
+        let address = wallet.generate_address()?;
+        let response = GetNewAddressResponse { address };
+        serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))
+    }
+
+    fn getbalance(&self) -> Result<Value, String> {
+        let wallet = self
+            .wallet
+            .lock()
+            .map_err(|_| "Lock poisoned".to_string())?;
+        let chain = self.chain.read().map_err(|_| "Lock poisoned".to_string())?;
+        let sats = wallet.get_balance(&chain)?;
+        let balance = sats as f64 / 100_000_000f64;
+        let response = GetBalanceResponse { balance };
+        serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))
+    }
+
+    fn listunspent(&self) -> Result<Value, String> {
+        let wallet = self
+            .wallet
+            .lock()
+            .map_err(|_| "Lock poisoned".to_string())?;
+        let chain = self.chain.read().map_err(|_| "Lock poisoned".to_string())?;
+        let utxos = wallet.get_utxos(&chain)?;
+        let tip = chain.get_tip().map_err(|e| format!("{:?}", e))?;
+        let tip_height = tip.as_ref().map(|t| t.height).unwrap_or(0);
+
+        let mut items = Vec::new();
+        for u in utxos {
+            let confirmations = if tip_height >= u.height {
+                tip_height - u.height + 1
+            } else {
+                0
+            };
+            items.push(ListUnspentItem {
+                txid: hex::encode(u.txid),
+                vout: u.vout,
+                amount: u.value as f64 / 100_000_000f64,
+                confirmations: confirmations as u32,
+                script_pubkey: hex::encode(&u.script_pubkey),
+            });
+        }
+
+        let response = ListUnspentResponse { utxos: items };
+        serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))
+    }
+
+    fn listaddresses(&self) -> Result<Value, String> {
+        let wallet = self
+            .wallet
+            .lock()
+            .map_err(|_| "Lock poisoned".to_string())?;
+
+        let addresses = wallet.addresses();
+        let response = ListAddressesResponse { addresses };
+
+        serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))
+    }
+
+    fn sendtoaddress(&self, params: &Value) -> Result<Value, String> {
+        let addr = params
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .ok_or("Invalid params: expected [address, amount]")?;
+
+        let amount = params
+            .as_array()
+            .and_then(|arr| arr.get(1))
+            .and_then(|v| v.as_f64())
+            .ok_or("Invalid params: expected [address, amount]")?;
+
+        if amount <= 0.0 {
+            return Err("Amount must be positive".to_string());
+        }
+
+        let sats = (amount * 100_000_000f64).round() as u64;
+        let fee = 1000u64;
+
+        // Build transaction under read lock, then submit to mempool.
+        // The background mining loop pulls from the mempool and includes
+        // it in the next block — no PoW in the RPC handler, so the RPC
+        // server stays responsive.
+        let tx = {
+            let mut wallet = self
+                .wallet
+                .lock()
+                .map_err(|_| "Lock poisoned".to_string())?;
+            let chain = self.chain.read().map_err(|_| "Lock poisoned".to_string())?;
+            TransactionBuilder::create_transaction(&mut wallet, &chain, addr, sats, fee)
+                .map_err(|e| format!("Transaction creation failed: {}", e))?
+        };
+
+        let txid = hex::encode(tx.txid());
+        self.mempool
+            .add_transaction(tx)
+            .map_err(|e| format!("Mempool rejected transaction: {}", e))?;
+
+        let response = SendToAddressResponse {
+            txid,
+            blockhash: String::new(),
+        };
+        serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))
+    }
+
+    fn getblock(&self, params: &Value) -> Result<Value, String> {
+        let arr = params.as_array().ok_or("Invalid params: expected array")?;
+        let blockhash_hex = arr
+            .first()
+            .and_then(|v| v.as_str())
+            .ok_or("Invalid params: expected [blockhash]")?;
+        let verbose = arr.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let blockhash_bytes = hex::decode(blockhash_hex).map_err(|_| "Invalid hex".to_string())?;
+        if blockhash_bytes.len() != 32 {
+            return Err("Invalid hash length".to_string());
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&blockhash_bytes);
+
+        let chain = self
+            .chain
+            .try_read()
+            .map_err(|_| "Chain busy".to_string())?;
+
+        let block = match chain.get_block(&hash) {
+            Some(b) => b.clone(),
+            None => chain
+                .block_store
+                .get_block(&hash)
+                .map_err(|e| e.to_string())?
+                .ok_or("Block not found".to_string())?,
+        };
+
+        let height = chain
+            .get_height_for_hash(&hash)
+            .or_else(|| {
+                chain
+                    .block_store
+                    .get_block_meta(&hash)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.height)
+            })
+            .unwrap_or(0) as u32;
+
+        drop(chain);
+
+        let network_prefix = self.network_prefix;
+        let size = block.header.encoded_size()
+            + varint::encode(block.transactions.len() as u64).len()
+            + block
+                .transactions
+                .iter()
+                .map(|tx| tx.encoded_size())
+                .sum::<usize>();
+        let n_tx = block.transactions.len();
+
+        // Derive miner address from coinbase tx output 0 script_pubkey.
+        let miner = block
+            .transactions
+            .first()
+            .and_then(|tx| tx.outputs.first())
+            .and_then(|out| script_pubkey_to_address(&out.script_pubkey, network_prefix));
+
+        let txids: Vec<String> = block
+            .transactions
+            .iter()
+            .map(|tx| hex::encode(tx.txid()))
+            .collect();
+
+        let transactions = if verbose {
+            Some(
+                block
+                    .transactions
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, tx)| {
+                        let is_coinbase = idx == 0;
+                        let vin = tx
+                            .inputs
+                            .iter()
+                            .map(|inp| {
+                                if is_coinbase {
+                                    VerboseTxInput {
+                                        txid: None,
+                                        vout: None,
+                                        coinbase: true,
+                                    }
+                                } else {
+                                    VerboseTxInput {
+                                        txid: Some(hex::encode(inp.prev_txid)),
+                                        vout: Some(inp.prev_index),
+                                        coinbase: false,
+                                    }
+                                }
+                            })
+                            .collect();
+                        let vout = tx
+                            .outputs
+                            .iter()
+                            .map(|out| VerboseTxOutput {
+                                value_frr: out.value as f64 / 100_000_000.0,
+                                address: script_pubkey_to_address(
+                                    &out.script_pubkey,
+                                    network_prefix,
+                                ),
+                            })
+                            .collect();
+                        VerboseTx {
+                            txid: hex::encode(tx.txid()),
+                            is_coinbase,
+                            vin,
+                            vout,
+                        }
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let response = GetBlockResponse {
+            hash: hex::encode(block.header.hash()),
+            height,
+            version: block.header.version,
+            merkleroot: hex::encode(block.header.merkle_root),
+            time: block.header.timestamp,
+            nonce: block.header.nonce,
+            bits: format!("{:08x}", block.header.n_bits),
+            size,
+            n_tx,
+            miner,
+            tx: txids,
+            transactions,
+        };
+
+        serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))
+    }
+
+    fn getblockhash(&self, params: &Value) -> Result<Value, String> {
+        let height = params
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_u64())
+            .ok_or("Invalid params: expected [height]")?;
+
+        let chain = self
+            .chain
+            .try_read()
+            .map_err(|_| "Chain busy".to_string())?;
+
+        let hash = chain
+            .block_store
+            .get_hash_by_height(height)
+            .map_err(|e| e.to_string())?
+            .ok_or("Block height out of range".to_string())?;
+
+        Ok(json!(hex::encode(hash)))
+    }
+
+    fn getbestblockhash(&self) -> Result<Value, String> {
+        let chain = self
+            .chain
+            .try_read()
+            .map_err(|_| "Chain busy".to_string())?;
+        let tip = chain.get_tip().map_err(|e| format!("{:?}", e))?;
+
+        match tip {
+            Some(t) => Ok(json!(hex::encode(t.block.header.hash()))),
+            None => Ok(json!(null)),
+        }
+    }
+
+    fn addnode(&self, params: &Value) -> Result<Value, String> {
+        let addr_str = params
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .ok_or("Invalid params: expected [address]")?;
+
+        let addr: std::net::SocketAddr = addr_str
+            .parse()
+            .map_err(|e| format!("Invalid address: {}", e))?;
+
+        self.peer_manager
+            .connect_to_peer(addr)
+            .map_err(|e| format!("Failed to connect: {}", e))?;
+
+        Ok(json!("added"))
+    }
+
+    fn getwalletinfo(&self) -> Result<Value, String> {
+        let wallet = self
+            .wallet
+            .lock()
+            .map_err(|_| "Lock poisoned".to_string())?;
+        let chain = self.chain.read().map_err(|_| "Lock poisoned".to_string())?;
+        let balance_sats = wallet.get_balance(&chain)?;
+        let response = GetWalletInfoResponse {
+            encrypted: wallet.is_encrypted(),
+            has_seed: wallet.has_seed(),
+            receive_addresses: wallet.receive_index(),
+            change_addresses: wallet.change_index(),
+            balance_sats,
+        };
+        serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))
+    }
+
+    fn encryptwallet(&self, params: &Value) -> Result<Value, String> {
+        let passphrase = params
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .ok_or("Invalid params: expected [passphrase]")?;
+
+        let wallet = self
+            .wallet
+            .lock()
+            .map_err(|_| "Lock poisoned".to_string())?;
+
+        if wallet.is_encrypted() {
+            return Err("Wallet is already encrypted".to_string());
+        }
+
+        wallet.save_encrypted(passphrase)?;
+        Ok(json!(
+            "Wallet encrypted. Restart node to load encrypted wallet."
+        ))
+    }
+
+    fn importseed(&self, params: &Value) -> Result<Value, String> {
+        let arr = params
+            .as_array()
+            .ok_or("Invalid params: expected [mnemonic, passphrase?]")?;
+
+        let mnemonic = arr
+            .first()
+            .and_then(|v| v.as_str())
+            .ok_or("Invalid params: expected [mnemonic, passphrase?]")?;
+
+        let bip39_passphrase = arr.get(1).and_then(|v| v.as_str()).unwrap_or("");
+
+        if !bip39_passphrase.is_empty() {
+            return Err(
+                "BIP39 passphrase not yet supported. Import using empty passphrase only."
+                    .to_string(),
+            );
+        }
+
+        let entropy =
+            bip39::mnemonic_to_entropy(mnemonic).map_err(|e| format!("Invalid mnemonic: {}", e))?;
+
+        if entropy.len() != 32 {
+            return Err(format!(
+                "Expected 32-byte entropy (256-bit mnemonic), got {}",
+                entropy.len()
+            ));
+        }
+
+        let mut entropy_arr = [0u8; 32];
+        entropy_arr.copy_from_slice(&entropy);
+
+        let mut wallet = self
+            .wallet
+            .lock()
+            .map_err(|_| "Lock poisoned".to_string())?;
+
+        wallet.set_seed(entropy_arr)?;
+
+        let response = ImportSeedResponse {
+            address_count: wallet.receive_index(),
+        };
+        serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))
+    }
+
+    fn getshamirshares(&self, params: &Value) -> Result<Value, String> {
+        let arr = params.as_array().ok_or("Invalid params: expected [m, n]")?;
+
+        let m = arr
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or("Invalid params: m must be a positive integer")? as u8;
+
+        let n = arr
+            .get(1)
+            .and_then(|v| v.as_u64())
+            .ok_or("Invalid params: n must be a positive integer")? as u8;
+
+        let wallet = self
+            .wallet
+            .lock()
+            .map_err(|_| "Lock poisoned".to_string())?;
+
+        if !wallet.has_seed() {
+            return Err("No seed to split".to_string());
+        }
+
+        let entropy = wallet
+            .seed_entropy()
+            .ok_or("Seed entropy unavailable".to_string())?;
+
+        let raw_shares =
+            shamir::split(&entropy, m, n).map_err(|e| format!("Shamir split failed: {}", e))?;
+
+        let shares = raw_shares
+            .into_iter()
+            .map(|s| ShamirShare {
+                index: s[0],
+                share: hex::encode(&s[1..]),
+            })
+            .collect();
+
+        let response = GetShamirSharesResponse { shares, m, n };
+        serde_json::to_value(response).map_err(|e| format!("Serialization error: {}", e))
+    }
+
+    fn error_response(
+        &self,
+        id: Value,
+        code: i32,
+        message: &str,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        self.json_response(self.error_value(id, code, message))
+    }
+
+    fn json_response(&self, body: Value) -> Response<std::io::Cursor<Vec<u8>>> {
+        Response::from_string(body.to_string()).with_header(
+            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
+        )
+    }
+
+    fn success_value(&self, id: Value, result: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "result": result,
+            "id": id
+        })
+    }
+
+    fn error_value(&self, id: Value, code: i32, message: impl AsRef<str>) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": code,
+                "message": message.as_ref()
+            },
+            "id": id
+        })
+    }
+}
+
+fn difficulty_from_compact(bits: u32) -> Option<f64> {
+    if bits == 0 {
+        return None;
+    }
+    let exponent = ((bits >> 24) & 0xff) as i32;
+    let mantissa_u32 = bits & 0x00ff_ffff;
+    if mantissa_u32 == 0 {
+        return None;
+    }
+
+    let mantissa = mantissa_u32 as f64;
+    let target = mantissa * 2f64.powi(8 * (exponent - 3));
+
+    let diff1_mantissa = 0x0000ffffu32 as f64;
+    let diff1_exponent = 0x1d_i32;
+    let diff1_target = diff1_mantissa * 2f64.powi(8 * (diff1_exponent - 3));
+
+    Some(diff1_target / target)
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::RpcServer;
+
+    fn encode_basic(credential: &str) -> String {
+        // Minimal Base64 encoder for tests only.
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let input = credential.as_bytes();
+        let mut out = String::new();
+        for chunk in input.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+            let combined = (b0 << 16) | (b1 << 8) | b2;
+            out.push(CHARS[((combined >> 18) & 0x3f) as usize] as char);
+            out.push(CHARS[((combined >> 12) & 0x3f) as usize] as char);
+            if chunk.len() > 1 {
+                out.push(CHARS[((combined >> 6) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if chunk.len() > 2 {
+                out.push(CHARS[(combined & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn base64_decode_roundtrip() {
+        let credential = "cookie:deadbeefcafe1234";
+        let encoded = encode_basic(credential);
+        let decoded = RpcServer::base64_decode(&encoded).expect("should decode");
+        assert_eq!(std::str::from_utf8(&decoded).unwrap(), credential);
+    }
+
+    #[test]
+    fn base64_decode_invalid_char_returns_none() {
+        assert!(RpcServer::base64_decode("!!!").is_none());
+    }
+
+    #[test]
+    fn base64_decode_wrong_password_does_not_equal_expected() {
+        let expected = "cookie:correcttoken";
+        let encoded_wrong = encode_basic("cookie:wrongtoken");
+        let decoded = RpcServer::base64_decode(&encoded_wrong).unwrap();
+        let credential = std::str::from_utf8(&decoded).unwrap();
+        assert_ne!(credential, expected);
+    }
+
+    #[test]
+    fn base64_decode_missing_prefix_fails() {
+        // "Digest ..." is not "Basic ..." — check_auth would reject it.
+        // Test that stripping "Basic " prefix on a non-Basic header returns None.
+        let value = "Digest dXNlcjpwYXNz";
+        let result = value.strip_prefix("Basic ");
+        assert!(result.is_none());
+    }
+}

@@ -1,0 +1,292 @@
+use crate::consensus::block::{Block, BlockHeader, U256};
+use crate::primitives::hash::Hash256;
+use crate::storage::{Database, CF_BLOCKS, CF_BLOCK_INDEX, CF_BLOCK_META, CF_HEADERS};
+use std::sync::Arc;
+
+const HEADER_HEIGHT_PREFIX: &[u8] = b"hh:";
+
+/// Block metadata for index (Internal use or if we want to store it separately)
+#[derive(Debug, Clone)]
+pub struct BlockMeta {
+    pub height: u64,
+    pub hash: Hash256,
+    pub cumulative_work: U256,
+}
+
+impl BlockMeta {
+    /// Serialize to bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.height.to_le_bytes());
+        bytes.extend_from_slice(&self.hash);
+        // U256 is wrapper around [u8; 32]
+        bytes.extend_from_slice(&self.cumulative_work.0);
+        bytes
+    }
+
+    /// Deserialize from bytes
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 8 + 32 + 32 {
+            return Err("Invalid BlockMeta bytes".to_string());
+        }
+
+        let height = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let hash = bytes[8..40].try_into().map_err(|_| "Invalid hash bytes")?;
+
+        let mut work_bytes = [0u8; 32];
+        work_bytes.copy_from_slice(&bytes[40..72]);
+        let cumulative_work = U256(work_bytes);
+
+        Ok(Self {
+            height,
+            hash,
+            cumulative_work,
+        })
+    }
+}
+
+/// Block storage interface
+pub struct BlockStore {
+    db: Arc<Database>,
+}
+
+impl BlockStore {
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+
+    fn header_height_key(height: u64) -> [u8; 11] {
+        let mut out = [0u8; 11];
+        out[..3].copy_from_slice(HEADER_HEIGHT_PREFIX);
+        out[3..].copy_from_slice(&height.to_le_bytes());
+        out
+    }
+
+    /// Store block
+    pub fn store_block(
+        &self,
+        block: &Block,
+        height: u64,
+        cumulative_work: U256,
+    ) -> Result<(), String> {
+        let block_hash = block.header.hash();
+
+        let block_bytes = bincode::serialize(block).map_err(|e| e.to_string())?;
+
+        let mut batch = self.db.batch();
+        batch.put(CF_BLOCKS, &block_hash, &block_bytes)?;
+
+        use crate::primitives::serialize::Encode;
+        let header_bytes = block.header.encode();
+        batch.put(CF_HEADERS, &block_hash, &header_bytes)?;
+
+        batch.put(CF_BLOCK_INDEX, &height.to_le_bytes(), &block_hash)?;
+
+        let meta = BlockMeta {
+            height,
+            hash: block_hash,
+            cumulative_work,
+        };
+        batch.put(CF_BLOCK_META, &block_hash, &meta.to_bytes())?;
+
+        batch.commit()
+    }
+
+    /// Store block WITHOUT updating the canonical height index (CF_BLOCK_INDEX).
+    /// Use this for side-chain (non-canonical) blocks to avoid corrupting the
+    /// height → hash mapping for the active chain.
+    pub fn store_block_no_index(
+        &self,
+        block: &Block,
+        height: u64,
+        cumulative_work: U256,
+    ) -> Result<(), String> {
+        let block_hash = block.header.hash();
+        let block_bytes = bincode::serialize(block).map_err(|e| e.to_string())?;
+
+        let mut batch = self.db.batch();
+        batch.put(CF_BLOCKS, &block_hash, &block_bytes)?;
+
+        use crate::primitives::serialize::Encode;
+        let header_bytes = block.header.encode();
+        batch.put(CF_HEADERS, &block_hash, &header_bytes)?;
+
+        let meta = BlockMeta {
+            height,
+            hash: block_hash,
+            cumulative_work,
+        };
+        batch.put(CF_BLOCK_META, &block_hash, &meta.to_bytes())?;
+
+        batch.commit()
+    }
+
+    /// Overwrite the canonical height index entry for `height` to point to `hash`.
+    /// Called during chain reorganisation to update the active-chain height map.
+    pub fn update_height_index(&self, height: u64, hash: &Hash256) -> Result<(), String> {
+        self.db.put(CF_BLOCK_INDEX, &height.to_le_bytes(), hash)
+    }
+
+    pub fn get_hash_by_height(&self, height: u64) -> Result<Option<Hash256>, String> {
+        match self.db.get(CF_BLOCK_INDEX, &height.to_le_bytes())? {
+            Some(h) => Ok(Some(h.try_into().map_err(|_| "Invalid hash")?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_header_hash_by_height(&self, height: u64) -> Result<Option<Hash256>, String> {
+        let key = Self::header_height_key(height);
+        if let Some(hash_bytes) = self.db.get(CF_HEADERS, &key)? {
+            return Ok(Some(
+                hash_bytes
+                    .try_into()
+                    .map_err(|_| "Invalid header hash in height index")?,
+            ));
+        }
+
+        self.get_hash_by_height(height)
+    }
+
+    pub fn get_header_hash_from_height_index(
+        &self,
+        height: u64,
+    ) -> Result<Option<Hash256>, String> {
+        let key = Self::header_height_key(height);
+        match self.db.get(CF_HEADERS, &key)? {
+            Some(hash_bytes) => Ok(Some(
+                hash_bytes
+                    .try_into()
+                    .map_err(|_| "Invalid header hash in height index")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Get block by hash
+    pub fn get_block(&self, hash: &Hash256) -> Result<Option<Block>, String> {
+        let bytes = self.db.get(CF_BLOCKS, hash)?;
+
+        match bytes {
+            Some(b) => {
+                let block = bincode::deserialize(&b).map_err(|e| e.to_string())?;
+                Ok(Some(block))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get block by height
+    pub fn get_block_by_height(&self, height: u64) -> Result<Option<Block>, String> {
+        // Get hash from index
+        let hash_bytes = self.db.get(CF_BLOCK_INDEX, &height.to_le_bytes())?;
+
+        match hash_bytes {
+            Some(h) => {
+                let hash: Hash256 = h.try_into().map_err(|_| "Invalid hash")?;
+                self.get_block(&hash)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get header by hash
+    pub fn get_header(&self, hash: &Hash256) -> Result<Option<BlockHeader>, String> {
+        let bytes = self.db.get(CF_HEADERS, hash)?;
+
+        match bytes {
+            Some(b) => {
+                use crate::primitives::serialize::Decode;
+                let (header, _) = BlockHeader::decode(&b).map_err(|e| format!("{:?}", e))?;
+                Ok(Some(header))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Store header only (without full block)
+    pub fn store_header(&self, header: &BlockHeader) -> Result<(), String> {
+        let hash = header.hash();
+        use crate::primitives::serialize::Encode;
+        let header_bytes = header.encode();
+        self.db.put(CF_HEADERS, &hash, &header_bytes)
+    }
+
+    pub fn store_header_at_height(&self, header: &BlockHeader, height: u64) -> Result<(), String> {
+        let hash = header.hash();
+        use crate::primitives::serialize::Encode;
+        let header_bytes = header.encode();
+
+        let key = Self::header_height_key(height);
+        let mut batch = self.db.batch();
+        batch.put(CF_HEADERS, &hash, &header_bytes)?;
+        batch.put(CF_HEADERS, &key, &hash)?;
+        batch.commit()
+    }
+
+    /// Write a batch of (header, height) pairs in a single atomic DB commit.
+    /// Reduces 2 000 individual fsyncs per headers batch to one.
+    pub fn store_headers_batch(&self, headers: &[(BlockHeader, u64)]) -> Result<(), String> {
+        use crate::primitives::serialize::Encode;
+        let mut batch = self.db.batch();
+        for (header, height) in headers {
+            let hash = header.hash();
+            let header_bytes = header.encode();
+            let key = Self::header_height_key(*height);
+            batch.put(CF_HEADERS, &hash, &header_bytes)?;
+            batch.put(CF_HEADERS, &key, &hash)?;
+        }
+        batch.commit()
+    }
+
+    pub fn get_header_by_height(&self, height: u64) -> Result<Option<BlockHeader>, String> {
+        let key = Self::header_height_key(height);
+        if let Some(hash_bytes) = self.db.get(CF_HEADERS, &key)? {
+            let hash: Hash256 = hash_bytes
+                .try_into()
+                .map_err(|_| "Invalid header hash in height index")?;
+            return self.get_header(&hash);
+        }
+
+        if let Some(hash) = self.get_hash_by_height(height)? {
+            return self.get_header(&hash);
+        }
+
+        Ok(None)
+    }
+
+    pub fn get_block_meta(&self, hash: &Hash256) -> Result<Option<BlockMeta>, String> {
+        if let Some(b) = self.db.get(CF_BLOCK_META, hash)? {
+            return Ok(Some(BlockMeta::from_bytes(&b)?));
+        }
+
+        Ok(None)
+    }
+
+    /// Check if block exists
+    pub fn has_block(&self, hash: &Hash256) -> Result<bool, String> {
+        Ok(self.db.get(CF_BLOCKS, hash)?.is_some())
+    }
+
+    /// Get blockchain height (highest stored block)
+    pub fn get_height(&self) -> Result<Option<u64>, String> {
+        let items = self.db.iter(CF_BLOCK_INDEX)?;
+
+        if items.is_empty() {
+            return Ok(None);
+        }
+
+        // Keys are u64 LE bytes
+        let max_height = items
+            .iter()
+            .map(|(key, _)| {
+                if key.len() >= 8 {
+                    u64::from_le_bytes(key[..8].try_into().unwrap())
+                } else {
+                    0
+                }
+            })
+            .max();
+
+        Ok(max_height)
+    }
+}

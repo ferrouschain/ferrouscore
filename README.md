@@ -120,12 +120,12 @@ curl -X POST http://127.0.0.1:8332 \
 
 ### Roadmap
 
-- **Phase 1 (Current)**: Core foundation — RandomX PoW, UTXO, P2P, headers-first IBD (parallel IBD deployed).
+- **Phase 1 (Current)**: Core foundation and Mainnet launch — RandomX PoW, UTXO, P2P, headers-first IBD (parallel IBD deployed).
 - **Phase 2**: Parallel IBD completion (Phase 2 + Phase 3) + testnet reset.
 - **Phase 3**: Wallet integration — BIP39 seed phrase + Shamir's Secret Sharing recovery.
 - **Phase 4**: Post-Quantum Cryptography — CRYSTALS-Dilithium (before Ring CT).
 - **Phase 5**: Privacy Features — Ring Confidential Transactions + CLSAG.
-- **Phase 6**: Security audit + Mainnet launch.
+- **Phase 6**: Security audit.
 
 ## Documentation
 

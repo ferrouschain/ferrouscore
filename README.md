@@ -24,8 +24,8 @@ Featuring a custom-built P2P networking stack with automatic partition recovery,
 
 ```bash
 # Clone repository
-git clone https://github.com/ChronoCoders/ferrous
-cd ferrous
+git clone https://github.com/ferrouschain/ferrouscore
+cd ferrouschain
 
 # Run the full node with TUI dashboard (Regtest mode)
 cargo run --example node -- --dashboard --network regtest
@@ -76,8 +76,8 @@ curl -X POST http://127.0.0.1:8332 \
 
 ## Project Status
 
-**Version**: 0.1.0 (Alpha)
-**Phase**: Phase 1 Foundation (In Progress)
+**Version**: 1.0.0 
+**Phase**: Mainnet (In Progress)
 
 ### Implemented
 

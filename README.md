@@ -113,7 +113,7 @@ curl -X POST http://127.0.0.1:8332 \
   - `stop`
 - **UI**: Terminal User Interface (TUI) for real-time statistics.
 
-### Infrastructure (Live Testnet)
+### Infrastructure (Live mainnet)
 
 - `seed1.ferrous.network` — `45.77.153.141` — Vultr New York — mining
 - `seed4.ferrous.network` — `45.77.64.221` — Vultr Frankfurt — mining
@@ -150,7 +150,3 @@ cargo fmt --check
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
-
-## Contact
-
-Maintained by **ChronoCoders**.

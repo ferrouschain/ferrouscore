@@ -58,13 +58,13 @@ curl.exe -s -X POST http://127.0.0.1:18332 -H 'Content-Type: application/json' -
 cargo run --release --example monitor
 ```
 
-### Mining (Regtest)
+### Mining
 
-To mine blocks instantly in `regtest` mode, open a second terminal and use the RPC interface:
+To mine blocks instantly in `main` mode, open a second terminal and use the RPC interface:
 
 ```powershell
 # PowerShell
-Invoke-RestMethod -Uri http://127.0.0.1:8332 -Method Post -Body '{"jsonrpc": "2.0", "method": "mineblocks", "params": [10], "id": 1}' -ContentType "application/json"
+Invoke-MainMethod -Uri http://127.0.0.1:8332 -Method Post -Body '{"jsonrpc": "2.0", "method": "mineblocks", "params": [10], "id": 1}' -ContentType "application/json"
 ```
 
 ```bash
